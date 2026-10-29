@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0a1128">
+    <title>FanCart | Demand Forecaster</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script defer src="/static/vendor/chart.umd.min.js"></script>
+    <script type="module" src="/static/js/app.js"></script>
+  </head>
+  <body>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <main id="landing" class="landing-view">
+      <div class="ambient ambient-one" aria-hidden="true"></div>
+      <div class="ambient ambient-two" aria-hidden="true"></div>
+      <section class="auth-card" aria-labelledby="auth-title">
+        <a class="brand brand-auth" href="/" aria-label="FanCart home">
+          <span class="brand-mark" aria-hidden="true">F</span><span>FanCart</span>
+        </a>
+        <p class="eyebrow">Match day. Stock ready.</p>
+        <h1 id="auth-title">Demand that backs your team.</h1>
+        <p class="auth-intro">Turn cricket form and upcoming fixtures into smarter merchandise plans.</p>
+        <div class="auth-switch" role="tablist" aria-label="Account options">
+          <button type="button" class="auth-switch-button active" id="login-mode" role="tab" aria-selected="true">Login</button>
+          <button type="button" class="auth-switch-button" id="signup-mode" role="tab" aria-selected="false">Create Account</button>
+          <span class="switch-indicator" aria-hidden="true"></span>
+        </div>
+        <form id="auth-form" novalidate>
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" maxlength="64" required>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" maxlength="256" required>
+          <label class="remember-row" for="remember">
+            <input id="remember" name="remember" type="checkbox">
+            <span>Remember me for 30 days</span>
+          </label>
+          <p id="auth-error" class="inline-error" role="alert"></p>
+          <button id="auth-submit" class="button button-primary button-wide" type="submit">Log in</button>
+        </form>
+        <div class="auth-divider"><span>or explore</span></div>
+        <button id="demo-button" class="button button-quiet button-wide" type="button">Continue as Demo User</button>
+        <p class="auth-footnote">Forecasts are powered by a real model. Merchandise sales data is synthetic.</p>
+      </section>
+    </main>
+
+    <div id="dashboard" class="dashboard-view" hidden>
+      <header class="topbar">
+        <a class="brand" href="#" aria-label="FanCart dashboard">
+          <span class="brand-mark" aria-hidden="true">F</span><span>FanCart</span>
+        </a>
+        <div class="topbar-right">
+          <span id="data-badge" class="data-badge">Loading match source</span>
+          <span id="username-label" class="username-label"></span>
+          <button id="logout-button" class="button button-outline" type="button">Log out</button>
+        </div>
+      </header>
+      <main class="dashboard-main">
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="eyebrow">Your team, your stock edge</p>
+            <h1>FanCart: Crossover Sports-Merchandise Demand Forecaster</h1>
+            <p>Turn cricket form and upcoming fixtures into practical merchandise stock plans.</p>
+            <p id="welcome-message" class="welcome-message"></p>
+          </div>
+          <div class="hero-orbit" aria-hidden="true"><span>FC</span><i></i><b></b></div>
+        </section>
+        <section class="kpi-grid" aria-label="Forecast summary">
+          <article class="kpi-card">
+            <p>Forecast units · next 14 days</p><strong class="count-up loading" id="kpi-units">—</strong>
+            <span>Across supported teams and products</span>
+          </article>
+          <article class="kpi-card">
+            <p>Products at stockout risk</p><strong class="count-up loading" id="kpi-risk">—</strong>
+            <span>Compared with recent demand proxy</span>
+          </article>
+          <article class="kpi-card">
+            <p>Uplift from the next match</p><strong class="count-up loading" id="kpi-uplift">—</strong>
+            <span>Modelled post-match demand effect</span>
+          </article>
+        </section>
+        <nav class="tabs" role="tablist" aria-label="FanCart sections">
+          <button class="tab active" id="tab-forecast" role="tab" aria-selected="true" aria-controls="panel-forecast">Forecast</button>
+          <button class="tab" id="tab-whatif" role="tab" aria-selected="false" aria-controls="panel-whatif">What-If</button>
+          <button class="tab" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report">Model Report</button>
+          <button class="tab" id="tab-insights" role="tab" aria-selected="false" aria-controls="panel-insights">Insights</button>
+        </nav>
+        <section id="panel-forecast" class="tab-panel active" role="tabpanel" aria-labelledby="tab-forecast">
+          <div class="panel-heading">
+            <div><p class="eyebrow">Demand outlook</p><h2>Forecast</h2></div>
+            <div class="filter-row">
+              <label>Team<select id="forecast-team"></select></label>
+              <label>Product<select id="forecast-product"></select></label>
+            </div>
+          </div>
+          <p class="section-note">The solid line shows synthetic sales history; the forecast includes a 10th–90th percentile range.</p>
+          <div id="forecast-loading" class="chart-skeleton skeleton"></div>
+          <div class="chart-wrap" id="forecast-chart-wrap" hidden><canvas id="forecast-chart" role="img" aria-label="Actual sales and demand forecast"></canvas></div>
+        </section>
+        <section id="panel-whatif" class="tab-panel" role="tabpanel" aria-labelledby="tab-whatif" hidden>
+          <div class="panel-heading">
+            <div><p class="eyebrow">Plan for the result</p><h2>What-If Scenario</h2></div>
+          </div>
+          <form id="whatif-form" class="scenario-form">
+            <label>Team<select id="scenario-team" required></select></label>
+            <label>Product<select id="scenario-product" required></select></label>
+            <label>Upcoming match<select id="scenario-match" required></select></label>
+            <fieldset class="outcome-field">
+              <legend>Assumed outcome</legend>
+              <label><input type="radio" name="outcome" value="win" checked><span>Win</span></label>
+              <label><input type="radio" name="outcome" value="loss"><span>Loss</span></label>
+            </fieldset>
+            <label>Stock lead time <span class="input-suffix"><input id="lead-time" type="number" min="1" max="60" value="7" required><span>days</span></span></label>
+            <button class="button button-primary" type="submit">Calculate scenario</button>
+          </form>
+          <div id="whatif-loading" class="result-grid" hidden><div class="result-skeleton skeleton"></div><div class="result-skeleton skeleton"></div><div class="result-skeleton skeleton"></div></div>
+          <div id="whatif-results" hidden>
+            <div class="result-grid">
+              <article class="result-card"><span>7-day demand change</span><strong id="scenario-change">—</strong><small>Against the no-match-effect baseline</small></article>
+              <article class="result-card"><span>Uplift duration</span><strong id="scenario-duration">—</strong><small>Until demand uplift falls below 5%</small></article>
+              <article class="result-card"><span>Recommended stock</span><strong id="scenario-stock">—</strong><small id="scenario-stock-note"></small></article>
+            </div>
+            <p id="scenario-sentence" class="scenario-sentence"></p>
+            <div class="result-comparison"><span>Win demand, 7 days<strong id="win-demand">—</strong></span><span>Loss demand, 7 days<strong id="loss-demand">—</strong></span></div>
+          </div>
+        </section>
+        <section id="panel-report" class="tab-panel" role="tabpanel" aria-labelledby="tab-report" hidden>
+          <div class="panel-heading"><div><p class="eyebrow">Validation & explainability</p><h2>Model Report</h2></div></div>
+          <div id="report-loading" class="report-skeleton skeleton"></div>
+          <div id="report-content" hidden>
+            <p id="validation-note" class="section-note"></p>
+            <div class="report-grid">
+              <article class="surface-card"><h3>Model vs seasonal-naive baseline</h3><div class="chart-wrap compact"><canvas id="metrics-chart" role="img" aria-label="Model validation metrics compared with baseline"></canvas></div></article>
+              <article class="surface-card"><h3>Permutation feature importance</h3><div class="chart-wrap compact"><canvas id="importance-chart" role="img" aria-label="Permutation feature importance"></canvas></div></article>
+            </div>
+            <div class="metrics-table-wrap"><table class="metrics-table"><caption>Validation metrics · lower is better</caption><thead><tr><th>Metric</th><th>FanCart model</th><th>Seasonal naive</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
+            <p class="synthetic-note">Sales data is synthetic. Validation scores should not be interpreted as measured real-world store accuracy.</p>
+          </div>
+        </section>
+        <section id="panel-insights" class="tab-panel" role="tabpanel" aria-labelledby="tab-insights" hidden>
+          <div class="panel-heading"><div><p class="eyebrow">Descriptive patterns</p><h2>Insights</h2></div></div>
+          <div id="insights-loading" class="report-skeleton skeleton"></div>
+          <div id="insights-content" class="report-grid" hidden>
+            <article class="surface-card"><h3>Demand after a win vs a loss</h3><div class="chart-wrap compact"><canvas id="outcome-chart" role="img" aria-label="Average demand on match days after wins and losses"></canvas></div></article>
+            <article class="surface-card"><h3>Match day vs non-match day</h3><div class="chart-wrap compact"><canvas id="matchday-chart" role="img" aria-label="Average match-day demand compared with non-match days"></canvas></div></article>
+          </div>
+          <p id="insights-note" class="section-note"></p>
+        </section>
+        <footer class="dashboard-footer">FanCart is a planning aid. Match schedules are simulated; sales data is synthetic.</footer>
+      </main>
+    </div>
+  </body>
+</html>

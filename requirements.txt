@@ -1,0 +1,7 @@
+flask>=3.0,<4
+gunicorn>=23,<24
+pandas>=2.2,<3
+numpy>=1.26,<3
+scikit-learn>=1.5,<2
+joblib>=1.4,<2
+pytest>=8,<9
