@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import logging
 import os
 import re
@@ -27,6 +28,7 @@ from auth.service import (
 )
 from data.loader import load_match_data
 from data.synthetic import ACTIVE_TEAMS, PRODUCTS, generate_fixtures, generate_sales
+from data import user_data
 from ml.features import FEATURE_COLUMNS, build_features
 from ml.predict import (
     compare_scenarios,
@@ -99,10 +101,12 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         REMEMBER_COOKIE_SECURE=is_render,
         FANCART_MODEL_DIR=DEFAULT_MODEL_DIR,
         FANCART_USE_NETWORK=True,
+        MAX_CONTENT_LENGTH=10 * 1024 * 1024,
     )
     if config:
         app.config.update(config)
     db.initialize(app.config.get("DATABASE"))
+    user_data.initialize(app.config.get("DATABASE"))
     app.extensions["fancart_runtime"] = app.config.get("FANCART_RUNTIME")
     runtime_lock = threading.Lock()
     app.extensions["fancart_runtime_lock"] = runtime_lock
@@ -182,6 +186,71 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         token = request.cookies.get(REMEMBER_COOKIE, "")
         return validate_token(token, app.config.get("DATABASE")) if token else None
 
+    def is_demo_user(username: str | None = None) -> bool:
+        current_username = username if username is not None else authenticated_username()
+        return current_username is not None and current_username.casefold() == "demo_fan"
+
+    def current_data_user_id() -> int:
+        username = authenticated_username()
+        user_id = user_data.user_id(username or "", app.config.get("DATABASE"))
+        if user_id is None:
+            raise RuntimeError("The authenticated user no longer exists.")
+        return user_id
+
+    def current_runtime() -> RuntimeState:
+        base = runtime()
+        username = authenticated_username()
+        if username is None or is_demo_user(username):
+            return base
+        rows = user_data.records(current_data_user_id(), app.config.get("DATABASE"))
+        if not rows:
+            return base
+        overrides = pd.DataFrame(rows)
+        overrides["date"] = pd.to_datetime(overrides["date"]).dt.normalize()
+        overrides["units"] = overrides["units"].astype(int)
+        sales = base.sales.copy()
+        sales["date"] = pd.to_datetime(sales["date"]).dt.normalize()
+        keys = ["date", "team", "product"]
+        replacements = overrides.set_index(keys)["units"]
+        sales_index = pd.MultiIndex.from_frame(sales[keys])
+        custom_index = pd.MultiIndex.from_frame(overrides[keys])
+        replaced = sales_index.isin(custom_index)
+        sales.loc[replaced, "units"] = replacements.reindex(sales_index[replaced]).to_numpy()
+        missing_custom = ~custom_index.isin(sales_index)
+        if missing_custom.any():
+            additional = overrides.loc[missing_custom].copy()
+            additional["price"] = additional["product"].map(
+                {"jersey": 42.0, "cap": 18.0, "flag": 12.0}
+            )
+            sales = pd.concat([sales, additional], ignore_index=True)
+        sales = sales.sort_values(["team", "product", "date"]).reset_index(drop=True)
+        return RuntimeState(base.matches, base.fixtures, sales, base.source, base.model)
+
+    def validated_sales_row(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError("Each record must be a JSON object.")
+        try:
+            row_date = date.fromisoformat(str(raw.get("date", ""))).isoformat()
+        except ValueError as error:
+            raise ValueError("Date must use YYYY-MM-DD format.") from error
+        if date.fromisoformat(row_date) > date.today():
+            raise ValueError("Sales records cannot be dated in the future.")
+        team, product = raw.get("team"), raw.get("product")
+        if team not in ACTIVE_TEAMS:
+            raise ValueError("Select a valid team.")
+        if product not in PRODUCTS:
+            raise ValueError("Select a valid product.")
+        units = raw.get("units")
+        if isinstance(units, bool) or not isinstance(units, (int, float)):
+            raise ValueError("Units must be a non-negative whole number.")
+        if not np.isfinite(units) or int(units) != units or not 0 <= units <= 1_000_000:
+            raise ValueError("Units must be a non-negative whole number up to 1000000.")
+        return {"date": row_date, "team": team, "product": product, "units": int(units)}
+
+    demo_data_error = {
+        "error": "Demo user uses the sample data. Create an account to use your own data."
+    }
+
     @app.before_request
     def require_authentication():
         if not request.path.startswith("/api/"):
@@ -233,6 +302,8 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
                 "Username must be 3-64 characters using letters, numbers, dots, dashes or underscores.",
                 400,
             )
+        if username.strip().casefold() == "demo_fan":
+            return api_error("That username is reserved.", 409)
         if not isinstance(password, str) or not 6 <= len(password) <= 256:
             return api_error("Password must be between 6 and 256 characters.", 400)
         result = signup(username, password, app.config.get("DATABASE"))
@@ -307,9 +378,107 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         session["username"] = username
         return jsonify({"user": {"username": username}})
 
+    @app.get("/api/data/status")
+    def data_status():
+        username = authenticated_username()
+        if username is None or is_demo_user(username):
+            return jsonify(
+                {
+                    "source": "Source: Synthetic (sample data)",
+                    "record_count": 0,
+                    "demo_user": is_demo_user(username),
+                    "message": demo_data_error["error"] if is_demo_user(username) else None,
+                }
+            )
+        count = user_data.record_count(
+            current_data_user_id(), app.config.get("DATABASE")
+        )
+        return jsonify(
+            {
+                "source": "Source: Uploaded data" if count else "Source: Synthetic (sample data)",
+                "record_count": count,
+                "demo_user": False,
+                "message": None,
+            }
+        )
+
+    @app.post("/api/data/upload")
+    def data_upload():
+        if is_demo_user():
+            return jsonify(demo_data_error), 403
+        uploaded_file = request.files.get("file")
+        if uploaded_file is None or not uploaded_file.filename:
+            return api_error("Choose a CSV file to upload.", 400)
+        try:
+            frame = pd.read_csv(io.BytesIO(uploaded_file.read()))
+        except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
+            return api_error("The uploaded file must be a readable CSV file.", 400)
+        frame.columns = [str(column).strip().lower() for column in frame.columns]
+        required = {"date", "team", "product", "units"}
+        if not required.issubset(frame.columns):
+            return api_error("CSV must contain date, team, product and units columns.", 400)
+        if frame.empty:
+            return api_error("The CSV must contain at least one sales record.", 400)
+        if len(frame) > 100_000:
+            return api_error("Upload no more than 100000 sales records at a time.", 413)
+        try:
+            records = [
+                validated_sales_row(row)
+                for row in frame.loc[:, ["date", "team", "product", "units"]].to_dict("records")
+            ]
+        except ValueError as error:
+            return api_error(str(error), 400)
+        user_data.replace_records(
+            current_data_user_id(), records, app.config.get("DATABASE")
+        )
+        return jsonify(
+            {
+                "message": f"Uploaded {len(records)} sales records.",
+                "record_count": user_data.record_count(
+                    current_data_user_id(), app.config.get("DATABASE")
+                ),
+                "source": "Source: Uploaded data",
+            }
+        )
+
+    @app.post("/api/data/add-row")
+    def data_add_row():
+        if is_demo_user():
+            return jsonify(demo_data_error), 403
+        body = json_body()
+        if body is None:
+            return api_error("A JSON request body is required.", 400)
+        try:
+            row = validated_sales_row(body)
+        except ValueError as error:
+            return api_error(str(error), 400)
+        user_id = current_data_user_id()
+        user_data.upsert_record(user_id, row, app.config.get("DATABASE"))
+        count = user_data.record_count(user_id, app.config.get("DATABASE"))
+        return jsonify(
+            {
+                "message": "Sales record saved.",
+                "record_count": count,
+                "source": "Source: Uploaded data",
+            }
+        ), 201
+
+    @app.post("/api/data/reset")
+    def data_reset():
+        if is_demo_user():
+            return jsonify(demo_data_error), 403
+        user_data.reset(current_data_user_id(), app.config.get("DATABASE"))
+        return jsonify(
+            {
+                "message": "Your data was reset to the sample data.",
+                "record_count": 0,
+                "source": "Source: Synthetic (sample data)",
+            }
+        )
+
     @app.get("/api/meta")
     def meta():
-        state = runtime()
+        state = current_runtime()
         fixtures = state.fixtures.copy()
         today = pd.Timestamp.today().normalize()
         fixtures = fixtures[
@@ -335,7 +504,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/kpis")
     def kpis():
-        state = runtime()
+        state = current_runtime()
         today = pd.Timestamp.today().normalize()
         combinations = [(team, product) for team in ACTIVE_TEAMS for product in PRODUCTS]
         next_matches = {}
@@ -405,7 +574,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/forecast")
     def forecast():
-        state = runtime()
+        state = current_runtime()
         team, product = request.args.get("team"), request.args.get("product")
         if team not in ACTIVE_TEAMS:
             return api_error("Select a valid team.", 400)
@@ -463,7 +632,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.post("/api/whatif")
     def whatif():
-        state = runtime()
+        state = current_runtime()
         body = json_body()
         if body is None:
             return api_error("A JSON request body is required.", 400)
@@ -528,7 +697,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/report")
     def report():
-        state = runtime()
+        state = current_runtime()
         metrics_path = APP_ROOT / "metrics.json"
         try:
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -564,7 +733,7 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
 
     @app.get("/api/insights")
     def insights():
-        state = runtime()
+        state = current_runtime()
         history = state.matches.copy()
         history["date"] = pd.to_datetime(history["date"]).dt.normalize()
         history = history[history["winner"].notna()]

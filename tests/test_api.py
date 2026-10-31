@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import sqlite3
 import threading
 import time
@@ -63,6 +64,7 @@ def test_protected_routes_require_authentication(client):
         "/api/forecast?team=Chennai%20Super%20Kings&product=jersey",
         "/api/report",
         "/api/insights",
+        "/api/data/status",
     ]
     for path in paths:
         response = client.get(path)
@@ -104,6 +106,147 @@ def test_remember_token_authenticates_without_session(client, api_app):
     authenticated = remembered_client.get("/api/auth/me")
     assert authenticated.status_code == 200
     assert authenticated.json["user"]["username"] == "remember_fan"
+
+
+def test_demo_user_cannot_modify_sample_data(client):
+    client.post("/api/auth/demo", json={})
+    expected_error = {
+        "error": "Demo user uses the sample data. Create an account to use your own data."
+    }
+
+    upload = client.post(
+        "/api/data/upload",
+        data={
+            "file": (
+                io.BytesIO(b"date,team,product,units\n2026-10-28,Chennai Super Kings,jersey,999\n"),
+                "sales.csv",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+    add_row = client.post(
+        "/api/data/add-row",
+        json={
+            "date": date.today().isoformat(),
+            "team": "Chennai Super Kings",
+            "product": "jersey",
+            "units": 999,
+        },
+    )
+    reset = client.post("/api/data/reset")
+
+    for response in (upload, add_row, reset):
+        assert response.status_code == 403
+        assert response.json == expected_error
+    status = client.get("/api/data/status")
+    assert status.json["source"] == "Source: Synthetic (sample data)"
+    assert status.json["message"] == expected_error["error"]
+
+
+def test_demo_kpis_are_unchanged_after_another_user_uploads(api_app):
+    demo_client = api_app.test_client()
+    user_client = api_app.test_client()
+    demo_client.post("/api/auth/demo", json={})
+    before = demo_client.get("/api/kpis")
+    assert before.status_code == 200
+
+    signup = user_client.post(
+        "/api/auth/signup",
+        json={"username": "isolated_data_fan", "password": "safe-pass"},
+    )
+    assert signup.status_code == 201
+    upload = user_client.post(
+        "/api/data/upload",
+        data={
+            "file": (
+                io.BytesIO(
+                    (
+                        f"date,team,product,units\n"
+                        f"{(date.today() - timedelta(days=1)).isoformat()},"
+                        "Chennai Super Kings,jersey,100000\n"
+                    ).encode()
+                ),
+                "sales.csv",
+            )
+        },
+        content_type="multipart/form-data",
+    )
+    assert upload.status_code == 200, upload.json
+    assert user_client.get("/api/data/status").json["source"] == "Source: Uploaded data"
+
+    after = demo_client.get("/api/kpis")
+    assert after.status_code == 200
+    assert after.json == before.json
+
+
+def test_new_account_starts_with_synthetic_data(client):
+    signup = client.post(
+        "/api/auth/signup",
+        json={"username": "new_synthetic_fan", "password": "safe-pass"},
+    )
+    assert signup.status_code == 201
+
+    status = client.get("/api/data/status")
+    assert status.status_code == 200
+    assert status.json["source"] == "Source: Synthetic (sample data)"
+    assert status.json["record_count"] == 0
+    assert status.json["demo_user"] is False
+
+
+def test_demo_user_can_start_with_empty_database(tmp_path):
+    instance = create_app(
+        {
+            "TESTING": True,
+            "SECRET_KEY": "empty-demo-test-secret",
+            "DATABASE": tmp_path / "empty-demo.sqlite3",
+            "FANCART_MODEL_DIR": DEFAULT_MODEL_DIR,
+            "FANCART_USE_NETWORK": False,
+        }
+    )
+    client = instance.test_client()
+
+    demo = client.post("/api/auth/demo", json={})
+    assert demo.status_code == 200
+    assert demo.json["user"]["username"] == "demo_fan"
+    assert client.get("/api/auth/me").json["user"]["username"] == "demo_fan"
+    assert client.get("/api/data/status").json["source"] == "Source: Synthetic (sample data)"
+
+
+def test_uploaded_sales_are_private_to_the_account(api_app):
+    owner = api_app.test_client()
+    other_user = api_app.test_client()
+    assert owner.post(
+        "/api/auth/signup",
+        json={"username": "private_data_owner", "password": "safe-pass"},
+    ).status_code == 201
+    assert other_user.post(
+        "/api/auth/signup",
+        json={"username": "separate_data_user", "password": "safe-pass"},
+    ).status_code == 201
+
+    uploaded = owner.post(
+        "/api/data/add-row",
+        json={
+            "date": date.today().isoformat(),
+            "team": "Chennai Super Kings",
+            "product": "jersey",
+            "units": 1234,
+        },
+    )
+    assert uploaded.status_code == 201
+    assert owner.get("/api/data/status").json["source"] == "Source: Uploaded data"
+    assert other_user.get("/api/data/status").json["source"] == "Source: Synthetic (sample data)"
+    assert other_user.get("/api/data/status").json["record_count"] == 0
+
+
+def test_demo_username_cannot_be_registered(client):
+    response = client.post(
+        "/api/auth/signup",
+        json={"username": "DEMO_FAN", "password": "safe-pass"},
+    )
+
+    assert response.status_code == 409
+    assert response.json == {"error": "That username is reserved."}
 
 
 def test_expired_remember_token_is_rejected(client, api_app):

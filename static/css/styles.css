@@ -128,6 +128,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .metrics-table th { color: #aab8cf; font-size: .76rem; font-weight: 700; }
 .metrics-table td { color: #e1e9f6; font-size: .84rem; }
 .synthetic-note { padding: 12px 15px; border: 1px solid #324a3e; border-radius: 9px; background: #10251f; color: #b9d7c6; font-size: .8rem; }
+.data-source { display: inline-block; margin: 0 0 14px; padding: 8px 11px; border: 1px solid #2e4355; border-radius: 999px; background: #122335; color: #c6d6df; font-size: .8rem; }
+.data-form { display: grid; align-content: start; gap: 10px; }
+.data-form h3 { margin-bottom: 5px; }
+.data-form label { color: #b6c3d8; font-size: .82rem; font-weight: 650; }
+.data-form input[type="file"], .data-form input[type="date"], .data-form input[type="number"] { width: 100%; min-height: 42px; padding: 9px 10px; border: 1px solid #344260; border-radius: 9px; background: #0a132a; color: var(--text); }
+.data-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 15px; color: var(--muted); font-size: .82rem; }
+.data-actions button { border-color: #74434c; color: #ffd9df; }
 .dashboard-footer { padding: 5px 0 30px; color: #72809a; font-size: .75rem; }
 .skeleton { position: relative; overflow: hidden; border-radius: 12px; background: linear-gradient(100deg, #111b35 30%, #1a2848 45%, #111b35 60%); background-size: 200% 100%; animation: shimmer 1.5s ease-in-out infinite; }
 @keyframes shimmer { to { background-position-x: -200%; } }

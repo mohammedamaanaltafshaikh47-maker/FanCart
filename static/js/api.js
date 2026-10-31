@@ -4,7 +4,9 @@ export async function apiRequest(path, options = {}) {
     credentials: "include",
     ...fetchOptions,
     headers: {
-      ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+      ...(fetchOptions.body && !(fetchOptions.body instanceof FormData)
+        ? { "Content-Type": "application/json" }
+        : {}),
       ...fetchOptions.headers,
     },
   });

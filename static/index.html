@@ -84,6 +84,7 @@
           <button class="tab" id="tab-whatif" role="tab" aria-selected="false" aria-controls="panel-whatif">What-If</button>
           <button class="tab" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report">Model Report</button>
           <button class="tab" id="tab-insights" role="tab" aria-selected="false" aria-controls="panel-insights">Insights</button>
+          <button class="tab" id="tab-data" role="tab" aria-selected="false" aria-controls="panel-data">Data</button>
         </nav>
         <section id="panel-forecast" class="tab-panel active" role="tabpanel" aria-labelledby="tab-forecast">
           <div class="panel-heading">
@@ -145,6 +146,31 @@
             <article class="surface-card"><h3>Match day vs non-match day</h3><div class="chart-wrap compact"><canvas id="matchday-chart" role="img" aria-label="Average match-day demand compared with non-match days"></canvas></div></article>
           </div>
           <p id="insights-note" class="section-note"></p>
+        </section>
+        <section id="panel-data" class="tab-panel" role="tabpanel" aria-labelledby="tab-data" hidden>
+          <div class="panel-heading"><div><p class="eyebrow">Your sales records</p><h2>Data</h2></div></div>
+          <p id="data-source" class="data-source">Source: Synthetic (sample data)</p>
+          <p id="demo-data-message" class="synthetic-note" hidden></p>
+          <div id="data-controls">
+            <p class="section-note">Upload a CSV with date, team, product and units columns, or add an individual sales record. Your records are private to your account and replace matching sample records.</p>
+            <div class="report-grid">
+              <form id="upload-form" class="surface-card data-form">
+                <h3>Upload CSV</h3>
+                <label for="sales-file">Sales file</label>
+                <input id="sales-file" type="file" accept=".csv,text/csv" required>
+                <button class="button button-primary" type="submit">Upload data</button>
+              </form>
+              <form id="add-row-form" class="surface-card data-form">
+                <h3>Add a record</h3>
+                <label for="record-date">Date</label><input id="record-date" type="date" required>
+                <label for="record-team">Team</label><select id="record-team" required></select>
+                <label for="record-product">Product</label><select id="record-product" required></select>
+                <label for="record-units">Units</label><input id="record-units" type="number" min="0" max="1000000" step="1" required>
+                <button class="button button-primary" type="submit">Save record</button>
+              </form>
+            </div>
+            <div class="data-actions"><span id="data-record-count">0 uploaded records</span><button id="reset-data-button" class="button button-outline" type="button">Reset to sample data</button></div>
+          </div>
         </section>
         <footer class="dashboard-footer">FanCart is a planning aid. Match schedules are simulated; sales data is synthetic.</footer>
       </main>

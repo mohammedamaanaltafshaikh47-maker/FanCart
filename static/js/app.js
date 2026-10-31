@@ -5,7 +5,7 @@ import { renderForecast, renderImportance, renderInsights, renderMetricCompariso
 const $ = (selector) => document.querySelector(selector);
 let meta = null;
 let toastTimer;
-const tabIds = ["forecast", "whatif", "report", "insights"];
+const tabIds = ["forecast", "whatif", "report", "insights", "data"];
 const loadedPanels = new Set();
 
 function toast(message) {
@@ -59,7 +59,26 @@ async function loadMeta() {
   fillSelect($("#scenario-team"), meta.teams);
   fillSelect($("#forecast-product"), meta.products);
   fillSelect($("#scenario-product"), meta.products);
+  fillSelect($("#record-team"), meta.teams);
+  fillSelect($("#record-product"), meta.products);
+  const today = new Date();
+  $("#record-date").value = [
+    today.getFullYear(),
+    String(today.getMonth() + 1).padStart(2, "0"),
+    String(today.getDate()).padStart(2, "0"),
+  ].join("-");
   updateFixtureOptions();
+}
+
+async function loadDataStatus() {
+  const status = await apiRequest("/api/data/status");
+  $("#data-source").textContent = status.source;
+  $("#data-record-count").textContent = `${status.record_count} uploaded ${status.record_count === 1 ? "record" : "records"}`;
+  const controls = $("#data-controls");
+  const message = $("#demo-data-message");
+  controls.hidden = status.demo_user;
+  message.hidden = !status.demo_user;
+  message.textContent = status.demo_user ? status.message : "";
 }
 
 async function loadKpis() {
@@ -142,6 +161,7 @@ const panelLoaders = {
   forecast: loadForecast,
   report: loadReport,
   insights: loadInsights,
+  data: loadDataStatus,
 };
 
 function setTab(tab) {
@@ -171,7 +191,7 @@ function initializeTabs() {
 async function loadDashboard() {
   try {
     await loadMeta();
-    const tasks = [loadKpis(), loadForecast()];
+    const tasks = [loadKpis(), loadForecast(), loadDataStatus()];
     loadedPanels.add("forecast");
     await Promise.all(tasks);
   } catch (error) {
@@ -216,12 +236,78 @@ async function submitWhatIf(event) {
   }
 }
 
+async function refreshPersonalData() {
+  await Promise.all([loadDataStatus(), loadKpis(), loadForecast()]);
+  loadedPanels.add("forecast");
+}
+
+async function uploadSalesData(event) {
+  event.preventDefault();
+  const file = $("#sales-file").files[0];
+  if (!file) {
+    toast("Choose a CSV file to upload.");
+    return;
+  }
+  const formData = new FormData();
+  formData.append("file", file);
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    const result = await apiRequest("/api/data/upload", { method: "POST", body: formData });
+    toast(result.message);
+    event.currentTarget.reset();
+    await refreshPersonalData();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function addSalesRow(event) {
+  event.preventDefault();
+  const button = event.currentTarget.querySelector("button[type=submit]");
+  button.disabled = true;
+  try {
+    const result = await postJSON("/api/data/add-row", {
+      date: $("#record-date").value,
+      team: $("#record-team").value,
+      product: $("#record-product").value,
+      units: Number($("#record-units").value),
+    });
+    toast(result.message);
+    $("#record-units").value = "";
+    await refreshPersonalData();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function resetSalesData() {
+  const button = $("#reset-data-button");
+  button.disabled = true;
+  try {
+    const result = await postJSON("/api/data/reset", {});
+    toast(result.message);
+    await refreshPersonalData();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function bindDashboard() {
   initializeTabs();
   $("#forecast-team").addEventListener("change", () => loadForecast().catch((error) => toast(error.message)));
   $("#forecast-product").addEventListener("change", () => loadForecast().catch((error) => toast(error.message)));
   $("#scenario-team").addEventListener("change", updateFixtureOptions);
   $("#whatif-form").addEventListener("submit", submitWhatIf);
+  $("#upload-form").addEventListener("submit", uploadSalesData);
+  $("#add-row-form").addEventListener("submit", addSalesRow);
+  $("#reset-data-button").addEventListener("click", resetSalesData);
   $("#logout-button").addEventListener("click", async () => {
     try {
       await postJSON("/api/auth/logout", {});
