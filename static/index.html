@@ -65,26 +65,49 @@
           </div>
           <div class="hero-orbit" aria-hidden="true"><span>FC</span><i></i><b></b></div>
         </section>
-        <section class="kpi-grid" aria-label="Forecast summary">
-          <article class="kpi-card">
-            <p>Forecast units · next 14 days</p><strong class="count-up loading" id="kpi-units">—</strong>
-            <span>Across supported teams and products</span>
-          </article>
-          <article class="kpi-card">
-            <p>Products at stockout risk</p><strong class="count-up loading" id="kpi-risk">—</strong>
-            <span>Compared with recent demand proxy</span>
-          </article>
-          <article class="kpi-card">
-            <p>Uplift from the next match</p><strong class="count-up loading" id="kpi-uplift">—</strong>
-            <span>Modelled post-match demand effect</span>
-          </article>
+        <section class="your-data-panel" aria-labelledby="your-data-title">
+          <div class="data-panel-heading">
+            <div><p class="eyebrow">Private workspace</p><h2 id="your-data-title">Your Data</h2></div>
+            <span id="model-status" class="model-status">Ready</span>
+          </div>
+          <dl class="data-summary">
+            <div><dt>Source</dt><dd id="data-source">Sample data (synthetic)</dd></div>
+            <div><dt>Rows</dt><dd id="data-rows">—</dd></div>
+            <div><dt>Date range</dt><dd id="data-date-range">—</dd></div>
+            <div><dt>Teams</dt><dd id="data-teams">—</dd></div>
+            <div><dt>Products</dt><dd id="data-products">—</dd></div>
+          </dl>
+          <p id="demo-data-message" class="demo-data-message" hidden></p>
+          <p id="data-model-error" class="data-model-error" role="alert" hidden></p>
+          <fieldset id="data-controls" class="data-controls">
+            <div class="data-control-grid">
+              <section class="data-control-card">
+                <h3>Upload CSV</h3>
+                <form id="upload-form" class="upload-form">
+                  <label id="upload-drop-zone" class="upload-drop-zone" for="sales-file">
+                    <input id="sales-file" name="file" type="file" accept=".csv,text/csv" required>
+                    <span id="upload-file-label">Drop a CSV here or browse</span>
+                  </label>
+                  <button class="button button-primary" type="submit">Upload CSV</button>
+                </form>
+                <div class="data-download-links">
+                  <a class="button button-outline template-link" href="/api/data/template" download>Download CSV template</a>
+                  <a class="button button-outline template-link" href="/api/data/sample" download>Download sample data</a>
+                </div>
+              </section>
+              <section class="data-control-card data-quick-actions">
+                <h3>Manage records</h3>
+                <button id="open-record-dialog" class="button button-quiet" type="button">Add one record</button>
+                <button id="reset-data-button" class="button button-outline" type="button">Reset to sample data</button>
+              </section>
+            </div>
+          </fieldset>
         </section>
         <nav class="tabs" role="tablist" aria-label="FanCart sections">
           <button class="tab active" id="tab-forecast" role="tab" aria-selected="true" aria-controls="panel-forecast">Forecast</button>
           <button class="tab" id="tab-whatif" role="tab" aria-selected="false" aria-controls="panel-whatif">What-If</button>
           <button class="tab" id="tab-report" role="tab" aria-selected="false" aria-controls="panel-report">Model Report</button>
           <button class="tab" id="tab-insights" role="tab" aria-selected="false" aria-controls="panel-insights">Insights</button>
-          <button class="tab" id="tab-data" role="tab" aria-selected="false" aria-controls="panel-data">Data</button>
         </nav>
         <section id="panel-forecast" class="tab-panel active" role="tabpanel" aria-labelledby="tab-forecast">
           <div class="panel-heading">
@@ -94,7 +117,7 @@
               <label>Product<select id="forecast-product"></select></label>
             </div>
           </div>
-          <p class="section-note">The solid line shows synthetic sales history; the forecast includes a 10th–90th percentile range.</p>
+          <p id="sales-source-note" class="section-note">The solid line shows sales history; the forecast includes a 10th–90th percentile range.</p>
           <div id="forecast-loading" class="chart-skeleton skeleton"></div>
           <div class="chart-wrap" id="forecast-chart-wrap" hidden><canvas id="forecast-chart" role="img" aria-label="Actual sales and demand forecast"></canvas></div>
         </section>
@@ -135,7 +158,7 @@
               <article class="surface-card"><h3>Permutation feature importance</h3><div class="chart-wrap compact"><canvas id="importance-chart" role="img" aria-label="Permutation feature importance"></canvas></div></article>
             </div>
             <div class="metrics-table-wrap"><table class="metrics-table"><caption>Validation metrics · lower is better</caption><thead><tr><th>Metric</th><th>FanCart model</th><th>Seasonal naive</th></tr></thead><tbody id="metrics-body"></tbody></table></div>
-            <p class="synthetic-note">Sales data is synthetic. Validation scores should not be interpreted as measured real-world store accuracy.</p>
+            <p id="report-sales-note" class="synthetic-note">Validation scores should not be interpreted as measured real-world store accuracy.</p>
           </div>
         </section>
         <section id="panel-insights" class="tab-panel" role="tabpanel" aria-labelledby="tab-insights" hidden>
@@ -147,33 +170,19 @@
           </div>
           <p id="insights-note" class="section-note"></p>
         </section>
-        <section id="panel-data" class="tab-panel" role="tabpanel" aria-labelledby="tab-data" hidden>
-          <div class="panel-heading"><div><p class="eyebrow">Your sales records</p><h2>Data</h2></div></div>
-          <p id="data-source" class="data-source">Source: Synthetic (sample data)</p>
-          <p id="demo-data-message" class="synthetic-note" hidden></p>
-          <div id="data-controls">
-            <p class="section-note">Upload a CSV with date, team, product and units columns, or add an individual sales record. Your records are private to your account and replace matching sample records.</p>
-            <div class="report-grid">
-              <form id="upload-form" class="surface-card data-form">
-                <h3>Upload CSV</h3>
-                <label for="sales-file">Sales file</label>
-                <input id="sales-file" type="file" accept=".csv,text/csv" required>
-                <button class="button button-primary" type="submit">Upload data</button>
-              </form>
-              <form id="add-row-form" class="surface-card data-form">
-                <h3>Add a record</h3>
-                <label for="record-date">Date</label><input id="record-date" type="date" required>
-                <label for="record-team">Team</label><select id="record-team" required></select>
-                <label for="record-product">Product</label><select id="record-product" required></select>
-                <label for="record-units">Units</label><input id="record-units" type="number" min="0" max="1000000" step="1" required>
-                <button class="button button-primary" type="submit">Save record</button>
-              </form>
-            </div>
-            <div class="data-actions"><span id="data-record-count">0 uploaded records</span><button id="reset-data-button" class="button button-outline" type="button">Reset to sample data</button></div>
-          </div>
-        </section>
-        <footer class="dashboard-footer">FanCart is a planning aid. Match schedules are simulated; sales data is synthetic.</footer>
+        <footer id="dashboard-footer" class="dashboard-footer">FanCart is a planning aid. Match schedules are simulated; sales data is synthetic.</footer>
       </main>
     </div>
+    <dialog id="record-dialog" class="record-dialog" aria-labelledby="record-dialog-title">
+      <form id="add-row-form" class="record-form">
+        <div class="data-panel-heading"><div><p class="eyebrow">Sales entry</p><h2 id="record-dialog-title">Add one record</h2></div><button id="close-record-dialog" class="dialog-close" type="button" aria-label="Close">×</button></div>
+        <label for="record-date">Date</label><input id="record-date" type="date" required>
+        <label for="record-team">Team</label><select id="record-team" required></select>
+        <label for="record-product">Product</label><select id="record-product" required></select>
+        <label for="record-units">Units</label><input id="record-units" type="number" min="0" step="any" required>
+        <label for="record-price">Price</label><input id="record-price" type="number" min="0.01" step="any" required>
+        <button class="button button-primary" type="submit">Save record</button>
+      </form>
+    </dialog>
   </body>
 </html>

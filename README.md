@@ -31,6 +31,7 @@ The trained `models/fancart_model.joblib` bundle and `metrics.json` are part of 
 - `static/` contains the single-page HTML/CSS/vanilla JavaScript client. Charts use the locally bundled Chart.js library; a canvas renderer is available as a fallback.
 - `auth/db.py` and `auth/service.py` maintain the SQLite users and remember-token tables. Passwords are PBKDF2-HMAC-SHA256 hashes with random salts. The browser receives a signed Flask session cookie and, when requested, a separate HttpOnly remember-me token; only its SHA-256 digest is stored in SQLite.
 - `data/loader.py` fetches Cricsheet IPL JSON and falls back to generated results. `data/synthetic.py` provides sample match schedules and synthetic product sales.
+- `scripts/export_sample_csv.py` exports `sample_sales_data.csv` using the active match loader and the same synthetic sales effects. Run `python scripts/export_sample_csv.py` to regenerate the downloadable sample.
 - `ml/features.py`, `ml/train.py` and `ml/predict.py` build date-safe features, train median and 10th/90th percentile regressors, and produce forecasts and stock recommendations.
 - `models/` stores the model bundle; `metrics.json` stores its chronological validation metrics.
 
@@ -45,6 +46,7 @@ All routes return JSON except `/`, which serves the application. Authentication 
 | `POST` | `/api/auth/demo` | Start a session for the demo user. |
 | `POST` | `/api/auth/logout` | Revoke the remember-me token and clear cookies. |
 | `GET` | `/api/auth/me` | Return the current user, or `401`. |
+| `GET` | `/api/data/sample` | Download the reproducible, match-linked sample sales CSV. |
 | `GET` | `/api/meta` | Teams, products, next-30-day fixtures, match-data source and synthetic-sales note. |
 | `GET` | `/api/kpis` | Fourteen-day forecast units, stockout-risk count and next-match uplift. |
 | `GET` | `/api/forecast?team=&product=&days=` | Last 90 days of actual sales and forecast with 10th/90th percentile bounds. |

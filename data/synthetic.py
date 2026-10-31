@@ -117,14 +117,24 @@ def generate_sales(
     start: date | None = None,
     end: date | None = None,
     teams: tuple[str, ...] = ACTIVE_TEAMS,
+    random_seed: int | None = None,
+    team_level_scale: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
-    rng = np.random.default_rng(RANDOM_SEED + 2)
+    rng = np.random.default_rng(
+        RANDOM_SEED + 2 if random_seed is None else random_seed
+    )
     last_day = end or date.today()
     first_day = start or last_day - timedelta(days=730)
     dates = pd.date_range(first_day, last_day, freq="D")
     base_demand = {"jersey": 23.0, "cap": 13.0, "flag": 9.0}
     price = {"jersey": 42.0, "cap": 18.0, "flag": 12.0}
-    team_strength = {team: float(rng.uniform(0.9, 1.15)) for team in teams}
+    team_strength = {
+        team: float(
+            rng.uniform(0.9, 1.15)
+            * (rng.uniform(*team_level_scale) if team_level_scale else 1.0)
+        )
+        for team in teams
+    }
     history = matches if matches is not None else generate_matches()
     history = history.copy()
     history["date"] = pd.to_datetime(history["date"]).dt.normalize()

@@ -12,18 +12,22 @@ import pytest
 
 import app as app_module
 from app import REMEMBER_COOKIE, RuntimeState, create_app
+from data.synthetic import generate_matches
 from ml.train import DEFAULT_MODEL_DIR
+from scripts import export_sample_csv
 
 
 @pytest.fixture(scope="module")
 def api_app(tmp_path_factory):
     database = tmp_path_factory.mktemp("fancart-api") / "auth.sqlite3"
+    user_models = tmp_path_factory.mktemp("fancart-user-models")
     instance = create_app(
         {
             "TESTING": True,
             "SECRET_KEY": "test-secret",
             "DATABASE": database,
             "FANCART_MODEL_DIR": DEFAULT_MODEL_DIR,
+            "FANCART_USER_MODEL_DIR": user_models,
             "FANCART_USE_NETWORK": False,
         }
     )
@@ -33,6 +37,24 @@ def api_app(tmp_path_factory):
 @pytest.fixture
 def client(api_app):
     return api_app.test_client()
+
+
+def sales_csv(days=90, team="Sample United", product="scarf", units=100):
+    first_day = date.today() - timedelta(days=days - 1)
+    lines = ["date,team,product,units,price"]
+    for offset in range(days):
+        lines.append(
+            f"{(first_day + timedelta(days=offset)).isoformat()},{team},{product},{units},24.5"
+        )
+    return ("\n".join(lines) + "\n").encode()
+
+
+def upload_csv(client, content):
+    return client.post(
+        "/api/data/upload",
+        data={"file": (io.BytesIO(content), "sales.csv")},
+        content_type="multipart/form-data",
+    )
 
 
 def test_signup_login_and_logout(client):
@@ -65,6 +87,7 @@ def test_protected_routes_require_authentication(client):
         "/api/report",
         "/api/insights",
         "/api/data/status",
+        "/api/data/sample",
     ]
     for path in paths:
         response = client.get(path)
@@ -139,7 +162,7 @@ def test_demo_user_cannot_modify_sample_data(client):
         assert response.status_code == 403
         assert response.json == expected_error
     status = client.get("/api/data/status")
-    assert status.json["source"] == "Source: Synthetic (sample data)"
+    assert status.json["source"] == "synthetic"
     assert status.json["message"] == expected_error["error"]
 
 
@@ -147,7 +170,9 @@ def test_demo_kpis_are_unchanged_after_another_user_uploads(api_app):
     demo_client = api_app.test_client()
     user_client = api_app.test_client()
     demo_client.post("/api/auth/demo", json={})
-    before = demo_client.get("/api/kpis")
+    before = demo_client.get(
+        "/api/forecast?team=Chennai%20Super%20Kings&product=jersey"
+    )
     assert before.status_code == 200
 
     signup = user_client.post(
@@ -155,28 +180,156 @@ def test_demo_kpis_are_unchanged_after_another_user_uploads(api_app):
         json={"username": "isolated_data_fan", "password": "safe-pass"},
     )
     assert signup.status_code == 201
-    upload = user_client.post(
-        "/api/data/upload",
-        data={
-            "file": (
-                io.BytesIO(
-                    (
-                        f"date,team,product,units\n"
-                        f"{(date.today() - timedelta(days=1)).isoformat()},"
-                        "Chennai Super Kings,jersey,100000\n"
-                    ).encode()
-                ),
-                "sales.csv",
-            )
-        },
-        content_type="multipart/form-data",
-    )
+    upload = upload_csv(user_client, sales_csv(units=100000))
     assert upload.status_code == 200, upload.json
-    assert user_client.get("/api/data/status").json["source"] == "Source: Uploaded data"
+    assert user_client.get("/api/data/status").json["source"] == "uploaded"
 
-    after = demo_client.get("/api/kpis")
+    after = demo_client.get(
+        "/api/forecast?team=Chennai%20Super%20Kings&product=jersey"
+    )
     assert after.status_code == 200
     assert after.json == before.json
+
+
+def test_valid_upload_drives_user_meta_and_forecast(api_app):
+    user = api_app.test_client()
+    assert user.post(
+        "/api/auth/signup",
+        json={"username": "valid_upload_fan", "password": "safe-pass"},
+    ).status_code == 201
+
+    uploaded = upload_csv(user, sales_csv())
+    assert uploaded.status_code == 200, uploaded.json
+    status = user.get("/api/data/status").json
+    assert status["source"] == "uploaded"
+    assert status["rows"] == 90
+    assert status["teams"] == 1
+    assert status["products"] == 1
+    assert status["date_min"] == (date.today() - timedelta(days=89)).isoformat()
+    assert status["date_max"] == date.today().isoformat()
+
+    meta = user.get("/api/meta").json
+    assert meta["teams"] == ["Sample United"]
+    assert meta["products"] == ["scarf"]
+    assert meta["sales_note"] == "Using your uploaded data."
+    forecast = user.get("/api/forecast?team=Sample%20United&product=scarf")
+    assert forecast.status_code == 200, forecast.json
+    assert len(forecast.json["history"]) == 90
+    assert len(forecast.json["forecast"]) == 14
+
+
+def test_exported_sample_csv_passes_upload_validation(api_app, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        export_sample_csv,
+        "load_match_data",
+        lambda: (generate_matches(), "generated sample"),
+    )
+    csv_path = export_sample_csv.export_sample_csv(tmp_path / "sample_sales_data.csv")
+    assert csv_path.stat().st_size <= 2 * 1024 * 1024
+    user = api_app.test_client()
+    assert user.post(
+        "/api/auth/signup",
+        json={"username": "export_csv_fan", "password": "safe-pass"},
+    ).status_code == 201
+
+    uploaded = upload_csv(user, csv_path.read_bytes())
+    assert uploaded.status_code == 200, uploaded.json
+    assert uploaded.json["record_count"] == 6 * 3 * 731
+    status = user.get("/api/data/status").json
+    assert status["source"] == "uploaded"
+    assert status["teams"] == 6
+    assert status["products"] == 3
+    assert status["date_min"] == (date.today() - timedelta(days=730)).isoformat()
+    assert status["date_max"] == date.today().isoformat()
+
+
+def test_sample_csv_download_requires_login_and_returns_attachment(client):
+    signup = client.post(
+        "/api/auth/signup",
+        json={"username": "sample_download_fan", "password": "safe-pass"},
+    )
+    assert signup.status_code == 201
+
+    response = client.get("/api/data/sample")
+    assert response.status_code == 200
+    assert response.mimetype == "text/csv"
+    assert "sample_sales_data.csv" in response.headers["Content-Disposition"]
+    assert response.get_data().startswith(b"date,team,product,units,price")
+
+
+def test_upload_rejects_missing_column(client):
+    client.post(
+        "/api/auth/signup",
+        json={"username": "missing_column_fan", "password": "safe-pass"},
+    )
+    content = sales_csv().decode().splitlines()
+    response = upload_csv(client, "\n".join(line.rsplit(",", 1)[0] for line in content).encode())
+
+    assert response.status_code == 400
+    assert response.json == {"error": "CSV is missing required column(s): price."}
+
+
+def test_upload_rejects_negative_units_with_row_number(client):
+    client.post(
+        "/api/auth/signup",
+        json={"username": "negative_units_fan", "password": "safe-pass"},
+    )
+    content = sales_csv().decode().replace(",100,24.5", ",-1,24.5", 1).encode()
+    response = upload_csv(client, content)
+
+    assert response.status_code == 400
+    assert response.json == {"error": "Row 2: units must be at least 0."}
+
+
+def test_upload_rejects_bad_date_with_row_number(client):
+    client.post(
+        "/api/auth/signup",
+        json={"username": "bad_date_fan", "password": "safe-pass"},
+    )
+    lines = sales_csv().decode().splitlines()
+    lines[1] = "not-a-date" + lines[1][10:]
+    response = upload_csv(client, "\n".join(lines).encode())
+
+    assert response.status_code == 400
+    assert response.json == {"error": "Row 2: date is invalid."}
+
+
+def test_upload_rejects_too_little_history(client):
+    client.post(
+        "/api/auth/signup",
+        json={"username": "short_history_fan", "password": "safe-pass"},
+    )
+    response = upload_csv(client, sales_csv(days=30))
+
+    assert response.status_code == 400
+    assert "at least 90 days of history" in response.json["error"]
+
+
+def test_add_row_and_reset_return_to_sample_data(client):
+    client.post(
+        "/api/auth/signup",
+        json={"username": "add_reset_fan", "password": "safe-pass"},
+    )
+    added = client.post(
+        "/api/data/add-row",
+        json={
+            "date": date.today().isoformat(),
+            "team": "Local Club",
+            "product": "scarf",
+            "units": 12.5,
+            "price": 19.95,
+        },
+    )
+    assert added.status_code == 201, added.json
+    status = client.get("/api/data/status").json
+    assert status["source"] == "uploaded"
+    assert status["rows"] == 1
+
+    reset = client.post("/api/data/reset")
+    assert reset.status_code == 200
+    status = client.get("/api/data/status").json
+    assert status["source"] == "synthetic"
+    assert status["rows"] > 1
 
 
 def test_new_account_starts_with_synthetic_data(client):
@@ -188,8 +341,10 @@ def test_new_account_starts_with_synthetic_data(client):
 
     status = client.get("/api/data/status")
     assert status.status_code == 200
-    assert status.json["source"] == "Source: Synthetic (sample data)"
-    assert status.json["record_count"] == 0
+    assert status.json["source"] == "synthetic"
+    assert status.json["rows"] > 0
+    assert status.json["date_min"]
+    assert status.json["date_max"]
     assert status.json["demo_user"] is False
 
 
@@ -209,7 +364,7 @@ def test_demo_user_can_start_with_empty_database(tmp_path):
     assert demo.status_code == 200
     assert demo.json["user"]["username"] == "demo_fan"
     assert client.get("/api/auth/me").json["user"]["username"] == "demo_fan"
-    assert client.get("/api/data/status").json["source"] == "Source: Synthetic (sample data)"
+    assert client.get("/api/data/status").json["source"] == "synthetic"
 
 
 def test_uploaded_sales_are_private_to_the_account(api_app):
@@ -231,12 +386,13 @@ def test_uploaded_sales_are_private_to_the_account(api_app):
             "team": "Chennai Super Kings",
             "product": "jersey",
             "units": 1234,
+            "price": 42.0,
         },
     )
     assert uploaded.status_code == 201
-    assert owner.get("/api/data/status").json["source"] == "Source: Uploaded data"
-    assert other_user.get("/api/data/status").json["source"] == "Source: Synthetic (sample data)"
-    assert other_user.get("/api/data/status").json["record_count"] == 0
+    assert owner.get("/api/data/status").json["source"] == "uploaded"
+    assert other_user.get("/api/data/status").json["source"] == "synthetic"
+    assert other_user.get("/api/data/status").json["rows"] > 0
 
 
 def test_demo_username_cannot_be_registered(client):

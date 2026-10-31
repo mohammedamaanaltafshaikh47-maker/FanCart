@@ -15,11 +15,20 @@ def initialize(path: str | Path | None = None) -> None:
                 date TEXT NOT NULL,
                 team TEXT NOT NULL,
                 product TEXT NOT NULL,
-                units INTEGER NOT NULL CHECK (units >= 0),
+                units REAL NOT NULL CHECK (units >= 0),
+                price REAL NOT NULL DEFAULT 0 CHECK (price >= 0),
                 PRIMARY KEY (user_id, date, team, product)
             )
             """
         )
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(user_sales)")
+        }
+        if "price" not in columns:
+            connection.execute(
+                "ALTER TABLE user_sales ADD COLUMN price REAL NOT NULL DEFAULT 0"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS user_sales_user_id_idx ON user_sales(user_id)"
         )
@@ -38,7 +47,7 @@ def records(user_id_value: int, path: str | Path | None = None) -> list[dict[str
     with db.connect(path) as connection:
         rows = connection.execute(
             """
-            SELECT date, team, product, units
+            SELECT date, team, product, units, price
             FROM user_sales
             WHERE user_id = ?
             ORDER BY date, team, product
@@ -57,10 +66,10 @@ def replace_records(
         connection.execute("DELETE FROM user_sales WHERE user_id = ?", (user_id_value,))
         connection.executemany(
             """
-            INSERT INTO user_sales(user_id, date, team, product, units)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO user_sales(user_id, date, team, product, units, price)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, date, team, product)
-            DO UPDATE SET units = excluded.units
+            DO UPDATE SET units = excluded.units, price = excluded.price
             """,
             [
                 (
@@ -69,6 +78,7 @@ def replace_records(
                     row["team"],
                     row["product"],
                     row["units"],
+                    row.get("price", 0),
                 )
                 for row in rows
             ],
@@ -83,10 +93,10 @@ def upsert_record(
     with db.connect(path) as connection:
         connection.execute(
             """
-            INSERT INTO user_sales(user_id, date, team, product, units)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO user_sales(user_id, date, team, product, units, price)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id, date, team, product)
-            DO UPDATE SET units = excluded.units
+            DO UPDATE SET units = excluded.units, price = excluded.price
             """,
             (
                 user_id_value,
@@ -94,6 +104,7 @@ def upsert_record(
                 row["team"],
                 row["product"],
                 row["units"],
+                row.get("price", 0),
             ),
         )
 

@@ -99,7 +99,8 @@ def build_features(
         [frame["team"], frame["product"]], sort=False
     ).transform(lambda values: values.rolling(28, min_periods=1).mean())
 
-    product_codes = {product: index for index, product in enumerate(PRODUCTS)}
+    product_values = list(dict.fromkeys([*PRODUCTS, *frame["product"].unique()]))
+    product_codes = {product: index for index, product in enumerate(product_values)}
     frame["product"] = frame["product"].map(product_codes).fillna(-1).astype(int)
     frame["is_weekend"] = (frame["date"].dt.weekday >= 5).astype(int)
     frame["day_of_week"] = frame["date"].dt.weekday.astype(int)

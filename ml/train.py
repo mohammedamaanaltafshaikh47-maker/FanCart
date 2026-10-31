@@ -27,7 +27,12 @@ def _metrics(actual: np.ndarray, predicted: np.ndarray) -> dict[str, float]:
     }
 
 
-def train_models(features: pd.DataFrame, model_dir: str | Path = DEFAULT_MODEL_DIR) -> dict[str, Any]:
+def train_models(
+    features: pd.DataFrame,
+    model_dir: str | Path = DEFAULT_MODEL_DIR,
+    *,
+    artifact_path: str | Path | None = None,
+) -> dict[str, Any]:
     if "units" not in features or "date" not in features:
         raise ValueError("Training data must include units and date.")
     valid = features.dropna(subset=["units"]).copy()
@@ -79,19 +84,20 @@ def train_models(features: pd.DataFrame, model_dir: str | Path = DEFAULT_MODEL_D
         .sample(n=min(300, len(test_rows)), random_state=RANDOM_SEED)
         .reset_index(drop=True),
     }
-    destination = Path(model_dir)
-    destination.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, destination / "fancart_model.joblib")
-    with (destination.parent / "metrics.json").open("w", encoding="utf-8") as file:
-        json.dump(
-            {
-                "validation_cutoff": bundle["validation_cutoff"],
-                "model": model_metrics,
-                "seasonal_naive": baseline_metrics,
-            },
-            file,
-            indent=2,
-        )
+    destination = Path(artifact_path) if artifact_path else Path(model_dir) / "fancart_model.joblib"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, destination)
+    if artifact_path is None:
+        with (destination.parent.parent / "metrics.json").open("w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "validation_cutoff": bundle["validation_cutoff"],
+                    "model": model_metrics,
+                    "seasonal_naive": baseline_metrics,
+                },
+                file,
+                indent=2,
+            )
     return bundle
 
 

@@ -5,7 +5,9 @@ import { renderForecast, renderImportance, renderInsights, renderMetricCompariso
 const $ = (selector) => document.querySelector(selector);
 let meta = null;
 let toastTimer;
-const tabIds = ["forecast", "whatif", "report", "insights", "data"];
+let trainingPollTimer;
+let latestDataStatus = null;
+const tabIds = ["forecast", "whatif", "report", "insights"];
 const loadedPanels = new Set();
 
 function toast(message) {
@@ -14,19 +16,6 @@ function toast(message) {
   element.classList.add("show");
   window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => element.classList.remove("show"), 4200);
-}
-
-function animateCount(element, value, formatter = (number) => Math.round(number).toLocaleString()) {
-  const start = performance.now();
-  const duration = 800;
-  const target = Number(value) || 0;
-  function frame(now) {
-    const progress = Math.min((now - start) / duration, 1);
-    const eased = 1 - (1 - progress) ** 3;
-    element.textContent = formatter(target * eased);
-    if (progress < 1) requestAnimationFrame(frame);
-  }
-  requestAnimationFrame(frame);
 }
 
 function fillSelect(select, options, labelFor = (value) => value) {
@@ -53,14 +42,33 @@ function updateFixtureOptions() {
 }
 
 async function loadMeta() {
+  const previous = {
+    forecastTeam: $("#forecast-team").value,
+    forecastProduct: $("#forecast-product").value,
+    scenarioTeam: $("#scenario-team").value,
+    scenarioProduct: $("#scenario-product").value,
+    recordTeam: $("#record-team").value,
+    recordProduct: $("#record-product").value,
+  };
   meta = await apiRequest("/api/meta");
   $("#data-badge").textContent = meta.data_source;
-  fillSelect($("#forecast-team"), meta.teams);
-  fillSelect($("#scenario-team"), meta.teams);
-  fillSelect($("#forecast-product"), meta.products);
-  fillSelect($("#scenario-product"), meta.products);
-  fillSelect($("#record-team"), meta.teams);
-  fillSelect($("#record-product"), meta.products);
+  for (const [selector, value, options] of [
+    ["#forecast-team", previous.forecastTeam, meta.teams],
+    ["#scenario-team", previous.scenarioTeam, meta.teams],
+    ["#forecast-product", previous.forecastProduct, meta.products],
+    ["#scenario-product", previous.scenarioProduct, meta.products],
+    ["#record-team", previous.recordTeam, meta.teams],
+    ["#record-product", previous.recordProduct, meta.products],
+  ]) {
+    fillSelect($(selector), options);
+    if (options.includes(value)) $(selector).value = value;
+  }
+  $("#sales-source-note").textContent = meta.sales_note === "Using your uploaded data."
+    ? "Using your uploaded data. The forecast includes a 10th–90th percentile range."
+    : "The solid line shows synthetic sales history; the forecast includes a 10th–90th percentile range.";
+  $("#dashboard-footer").textContent = meta.sales_note === "Using your uploaded data."
+    ? "FanCart is a planning aid. Match schedules are simulated. Using your uploaded data."
+    : "FanCart is a planning aid. Match schedules are simulated; sales data is synthetic.";
   const today = new Date();
   $("#record-date").value = [
     today.getFullYear(),
@@ -72,23 +80,46 @@ async function loadMeta() {
 
 async function loadDataStatus() {
   const status = await apiRequest("/api/data/status");
-  $("#data-source").textContent = status.source;
-  $("#data-record-count").textContent = `${status.record_count} uploaded ${status.record_count === 1 ? "record" : "records"}`;
+  latestDataStatus = status;
+  $("#data-source").textContent = status.source === "uploaded"
+    ? "Your uploaded data"
+    : "Sample data (synthetic)";
+  $("#data-rows").textContent = Number(status.rows).toLocaleString();
+  $("#data-date-range").textContent = status.date_min && status.date_max
+    ? `${status.date_min} – ${status.date_max}`
+    : "—";
+  $("#data-teams").textContent = Number(status.teams).toLocaleString();
+  $("#data-products").textContent = Number(status.products).toLocaleString();
+  const modelStatus = $("#model-status");
+  modelStatus.textContent = status.training ? "Training your model..." : "Ready";
+  modelStatus.classList.toggle("is-training", status.training);
+  modelStatus.title = status.last_error || "";
+  const modelError = $("#data-model-error");
+  modelError.hidden = !status.last_error;
+  modelError.textContent = status.last_error ? `Model training failed: ${status.last_error}` : "";
   const controls = $("#data-controls");
   const message = $("#demo-data-message");
-  controls.hidden = status.demo_user;
+  controls.disabled = status.demo_user;
   message.hidden = !status.demo_user;
   message.textContent = status.demo_user ? status.message : "";
-}
-
-async function loadKpis() {
-  const kpis = await apiRequest("/api/kpis");
-  for (const element of [$("#kpi-units"), $("#kpi-risk"), $("#kpi-uplift")]) {
-    element.classList.remove("loading");
+  if (status.training && !trainingPollTimer) {
+    trainingPollTimer = window.setTimeout(async () => {
+      trainingPollTimer = null;
+      try {
+        const wasTraining = latestDataStatus?.training;
+        await loadDataStatus();
+        if (wasTraining && !latestDataStatus?.training) {
+          if (latestDataStatus.last_error) toast(latestDataStatus.last_error);
+          await refreshAfterTraining();
+        }
+      } catch (error) {
+        toast(error.message);
+      }
+    }, 2000);
+  } else if (!status.training && trainingPollTimer) {
+    window.clearTimeout(trainingPollTimer);
+    trainingPollTimer = null;
   }
-  animateCount($("#kpi-units"), kpis.forecast_units_14_days);
-  animateCount($("#kpi-risk"), kpis.products_at_stockout_risk);
-  animateCount($("#kpi-uplift"), kpis.next_match_uplift_pct, (number) => `${number >= 0 ? "+" : ""}${number.toFixed(1)}%`);
 }
 
 async function loadForecast() {
@@ -114,6 +145,9 @@ async function loadReport() {
   try {
     const report = await apiRequest("/api/report");
     $("#validation-note").textContent = `Chronological validation holdout beginning ${report.validation_cutoff}. Metrics are read from the saved model evaluation.`;
+    $("#report-sales-note").textContent = report.note === "Using your uploaded data."
+      ? "Using your uploaded data. Validation metrics reflect your trained model."
+      : "Sales data is synthetic. Validation scores should not be interpreted as measured real-world store accuracy.";
     const body = $("#metrics-body");
     body.replaceChildren();
     for (const metric of ["MAE", "RMSE", "MAPE"]) {
@@ -161,7 +195,6 @@ const panelLoaders = {
   forecast: loadForecast,
   report: loadReport,
   insights: loadInsights,
-  data: loadDataStatus,
 };
 
 function setTab(tab) {
@@ -191,7 +224,7 @@ function initializeTabs() {
 async function loadDashboard() {
   try {
     await loadMeta();
-    const tasks = [loadKpis(), loadForecast(), loadDataStatus()];
+    const tasks = [loadForecast(), loadDataStatus()];
     loadedPanels.add("forecast");
     await Promise.all(tasks);
   } catch (error) {
@@ -237,56 +270,96 @@ async function submitWhatIf(event) {
 }
 
 async function refreshPersonalData() {
-  await Promise.all([loadDataStatus(), loadKpis(), loadForecast()]);
+  await Promise.all([loadMeta(), loadDataStatus()]);
+  await loadForecast();
   loadedPanels.add("forecast");
+}
+
+async function refreshAfterTraining() {
+  await loadMeta();
+  await loadForecast();
+  const refreshes = [];
+  if (loadedPanels.has("report")) refreshes.push(loadReport());
+  if (loadedPanels.has("insights")) refreshes.push(loadInsights());
+  $("#whatif-results").hidden = true;
+  await Promise.all(refreshes);
 }
 
 async function uploadSalesData(event) {
   event.preventDefault();
-  const file = $("#sales-file").files[0];
+  const form = event.currentTarget;
+  if (!form || typeof form.querySelector !== "function") {
+    toast("The upload form is unavailable. Reload the page and try again.");
+    return;
+  }
+  const fileInput = $("#sales-file");
+  const file = fileInput?.files?.[0];
   if (!file) {
     toast("Choose a CSV file to upload.");
     return;
   }
   const formData = new FormData();
   formData.append("file", file);
-  const button = event.currentTarget.querySelector("button[type=submit]");
-  button.disabled = true;
+  const button = form.querySelector("button[type=submit]");
+  if (button) button.disabled = true;
   try {
     const result = await apiRequest("/api/data/upload", { method: "POST", body: formData });
     toast(result.message);
-    event.currentTarget.reset();
+    if (fileInput) fileInput.value = "";
+    const fileLabel = $("#upload-file-label");
+    if (fileLabel) fileLabel.textContent = "Drop a CSV here or browse";
     await refreshPersonalData();
   } catch (error) {
     toast(error.message);
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
 async function addSalesRow(event) {
   event.preventDefault();
-  const button = event.currentTarget.querySelector("button[type=submit]");
-  button.disabled = true;
+  const form = event.currentTarget;
+  if (!form || typeof form.querySelector !== "function") {
+    toast("The record form is unavailable. Reload the page and try again.");
+    return;
+  }
+  const dateInput = $("#record-date");
+  const teamSelect = $("#record-team");
+  const productSelect = $("#record-product");
+  const unitsInput = $("#record-units");
+  const priceInput = $("#record-price");
+  if (!dateInput || !teamSelect || !productSelect || !unitsInput || !priceInput) {
+    toast("The record form is incomplete. Reload the page and try again.");
+    return;
+  }
+  const button = form.querySelector("button[type=submit]");
+  if (button) button.disabled = true;
   try {
     const result = await postJSON("/api/data/add-row", {
-      date: $("#record-date").value,
-      team: $("#record-team").value,
-      product: $("#record-product").value,
-      units: Number($("#record-units").value),
+      date: dateInput.value,
+      team: teamSelect.value,
+      product: productSelect.value,
+      units: Number(unitsInput.value),
+      price: Number(priceInput.value),
     });
     toast(result.message);
-    $("#record-units").value = "";
+    $("#record-dialog")?.close();
+    unitsInput.value = "";
+    priceInput.value = "";
     await refreshPersonalData();
   } catch (error) {
     toast(error.message);
   } finally {
-    button.disabled = false;
+    if (button) button.disabled = false;
   }
 }
 
 async function resetSalesData() {
   const button = $("#reset-data-button");
+  if (!button) {
+    toast("The reset control is unavailable. Reload the page and try again.");
+    return;
+  }
   button.disabled = true;
   try {
     const result = await postJSON("/api/data/reset", {});
@@ -307,7 +380,34 @@ function bindDashboard() {
   $("#whatif-form").addEventListener("submit", submitWhatIf);
   $("#upload-form").addEventListener("submit", uploadSalesData);
   $("#add-row-form").addEventListener("submit", addSalesRow);
+  $("#open-record-dialog").addEventListener("click", () => $("#record-dialog").showModal());
+  $("#close-record-dialog").addEventListener("click", () => $("#record-dialog").close());
   $("#reset-data-button").addEventListener("click", resetSalesData);
+  $("#sales-file").addEventListener("change", (event) => {
+    $("#upload-file-label").textContent = event.currentTarget.files[0]?.name || "Drop a CSV here or browse";
+  });
+  const dropZone = $("#upload-drop-zone");
+  for (const eventName of ["dragenter", "dragover"]) {
+    dropZone.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      dropZone.classList.add("is-dragging");
+    });
+  }
+  for (const eventName of ["dragleave", "drop"]) {
+    dropZone.addEventListener(eventName, (event) => {
+      event.preventDefault();
+      dropZone.classList.remove("is-dragging");
+    });
+  }
+  dropZone.addEventListener("drop", (event) => {
+    const file = event.dataTransfer.files[0];
+    if (file) {
+      const transfer = new DataTransfer();
+      transfer.items.add(file);
+      $("#sales-file").files = transfer.files;
+      $("#upload-file-label").textContent = file.name;
+    }
+  });
   $("#logout-button").addEventListener("click", async () => {
     try {
       await postJSON("/api/auth/logout", {});

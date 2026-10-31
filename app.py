@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import threading
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request, send_from_directory, session
+from flask import Flask, jsonify, request, send_file, send_from_directory, session
 from sklearn.inspection import permutation_importance
 
 from auth import db
@@ -36,7 +37,7 @@ from ml.predict import (
     forecast_products_batch,
     recommend_stock,
 )
-from ml.train import DEFAULT_MODEL_DIR, load_or_train
+from ml.train import DEFAULT_MODEL_DIR, load_or_train, train_models
 
 APP_ROOT = Path(__file__).resolve().parent
 REMEMBER_COOKIE = "fancart_remember"
@@ -50,6 +51,7 @@ class RuntimeState:
     sales: pd.DataFrame
     source: str
     model: dict[str, Any]
+    sales_source: str = "synthetic"
 
 
 class ModelUnavailableError(Exception):
@@ -110,6 +112,12 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     app.extensions["fancart_runtime"] = app.config.get("FANCART_RUNTIME")
     runtime_lock = threading.Lock()
     app.extensions["fancart_runtime_lock"] = runtime_lock
+    user_training_lock = threading.Lock()
+    user_training_state_lock = threading.Lock()
+    user_training_state: dict[int, dict[str, Any]] = {}
+    user_models: OrderedDict[int, dict[str, Any]] = OrderedDict()
+    app.extensions["fancart_user_models"] = user_models
+    app.extensions["fancart_user_training"] = user_training_state
     training_status = {"started": False, "error": None}
     app.extensions["fancart_training_status"] = training_status
 
@@ -197,6 +205,110 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
             raise RuntimeError("The authenticated user no longer exists.")
         return user_id
 
+    def expanded_user_sales(rows: list[dict[str, Any]]) -> pd.DataFrame:
+        source = pd.DataFrame(rows)
+        source["date"] = pd.to_datetime(source["date"]).dt.normalize()
+        source["units"] = source["units"].astype(float)
+        source["price"] = source["price"].astype(float)
+        expanded: list[pd.DataFrame] = []
+        for (team, product), group in source.groupby(["team", "product"], sort=False):
+            group = group.set_index("date").sort_index()
+            last_day = max(group.index.max(), pd.Timestamp.today().normalize())
+            days = pd.date_range(group.index.min(), last_day, freq="D")
+            daily = group.reindex(days)
+            daily["units"] = daily["units"].fillna(0)
+            daily["price"] = daily["price"].replace(0, np.nan).ffill().bfill().fillna(1)
+            daily["team"] = team
+            daily["product"] = product
+            daily.index.name = "date"
+            expanded.append(daily.reset_index())
+        return pd.concat(expanded, ignore_index=True).sort_values(
+            ["team", "product", "date"]
+        ).reset_index(drop=True)
+
+    def user_model_path(user_id: int) -> Path:
+        model_dir = app.config.get("FANCART_USER_MODEL_DIR") or app.config["FANCART_MODEL_DIR"]
+        return Path(model_dir) / f"user_{user_id}.joblib"
+
+    def cache_user_model(user_id: int, model: dict[str, Any]) -> None:
+        user_models[user_id] = model
+        user_models.move_to_end(user_id)
+        while len(user_models) > 3:
+            user_models.popitem(last=False)
+
+    def user_status(user_id: int) -> dict[str, Any]:
+        with user_training_state_lock:
+            return dict(
+                user_training_state.get(
+                    user_id,
+                    {"training": False, "last_error": None, "version": 0, "worker": False},
+                )
+            )
+
+    def train_user_in_background(user_id: int) -> None:
+        while True:
+            with user_training_lock:
+                with user_training_state_lock:
+                    version = user_training_state[user_id]["version"]
+                rows = user_data.records(user_id, app.config.get("DATABASE"))
+                if not rows:
+                    user_models.pop(user_id, None)
+                    user_model_path(user_id).unlink(missing_ok=True)
+                    error = None
+                    trained_model = None
+                else:
+                    try:
+                        sales = expanded_user_sales(rows)
+                        pairs = sales.groupby(["team", "product"])["date"].agg(["min", "max"])
+                        if ((pairs["max"] - pairs["min"]).dt.days < 89).any():
+                            raise ValueError(
+                                "Each team/product pair must cover at least 90 days of history."
+                            )
+                        base = runtime()
+                        features = build_features(sales, base.matches, base.fixtures)
+                        trained_model = train_models(
+                            features,
+                            artifact_path=user_model_path(user_id),
+                        )
+                        error = None
+                    except Exception as training_error:
+                        app.logger.exception("Unable to train user model for user %s.", user_id)
+                        trained_model = None
+                        error = str(training_error)
+                with user_training_state_lock:
+                    state = user_training_state[user_id]
+                    if state["version"] != version:
+                        continue
+                    if trained_model is None:
+                        user_models.pop(user_id, None)
+                        if rows:
+                            user_model_path(user_id).unlink(missing_ok=True)
+                    else:
+                        cache_user_model(user_id, trained_model)
+                    state.update(
+                        {"training": False, "last_error": error, "worker": False}
+                    )
+                    return
+
+    def start_user_training(user_id: int) -> None:
+        with user_training_state_lock:
+            state = user_training_state.setdefault(
+                user_id,
+                {"training": False, "last_error": None, "version": 0, "worker": False},
+            )
+            state["version"] += 1
+            state["training"] = True
+            state["last_error"] = None
+            if state["worker"]:
+                return
+            state["worker"] = True
+        threading.Thread(
+            target=train_user_in_background,
+            args=(user_id,),
+            name=f"fancart-user-model-{user_id}",
+            daemon=True,
+        ).start()
+
     def current_runtime() -> RuntimeState:
         base = runtime()
         username = authenticated_username()
@@ -205,47 +317,89 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         rows = user_data.records(current_data_user_id(), app.config.get("DATABASE"))
         if not rows:
             return base
-        overrides = pd.DataFrame(rows)
-        overrides["date"] = pd.to_datetime(overrides["date"]).dt.normalize()
-        overrides["units"] = overrides["units"].astype(int)
-        sales = base.sales.copy()
-        sales["date"] = pd.to_datetime(sales["date"]).dt.normalize()
-        keys = ["date", "team", "product"]
-        replacements = overrides.set_index(keys)["units"]
-        sales_index = pd.MultiIndex.from_frame(sales[keys])
-        custom_index = pd.MultiIndex.from_frame(overrides[keys])
-        replaced = sales_index.isin(custom_index)
-        sales.loc[replaced, "units"] = replacements.reindex(sales_index[replaced]).to_numpy()
-        missing_custom = ~custom_index.isin(sales_index)
-        if missing_custom.any():
-            additional = overrides.loc[missing_custom].copy()
-            additional["price"] = additional["product"].map(
-                {"jersey": 42.0, "cap": 18.0, "flag": 12.0}
-            )
-            sales = pd.concat([sales, additional], ignore_index=True)
-        sales = sales.sort_values(["team", "product", "date"]).reset_index(drop=True)
-        return RuntimeState(base.matches, base.fixtures, sales, base.source, base.model)
+        user_id = current_data_user_id()
+        sales = expanded_user_sales(rows)
+        model = user_models.get(user_id)
+        if model is not None:
+            user_models.move_to_end(user_id)
+        if model is None:
+            artifact = user_model_path(user_id)
+            if artifact.is_file():
+                try:
+                    import joblib
 
-    def validated_sales_row(raw: Any) -> dict[str, Any]:
+                    model = joblib.load(artifact)
+                    cache_user_model(user_id, model)
+                except Exception:
+                    app.logger.exception("Unable to load user model for user %s.", user_id)
+        return RuntimeState(
+            base.matches,
+            base.fixtures,
+            sales,
+            base.source,
+            model or base.model,
+            "uploaded",
+        )
+
+    def validated_sales_row(raw: Any, row_number: int | None = None) -> dict[str, Any]:
+        prefix = f"Row {row_number}: " if row_number is not None else ""
         if not isinstance(raw, dict):
-            raise ValueError("Each record must be a JSON object.")
-        try:
-            row_date = date.fromisoformat(str(raw.get("date", ""))).isoformat()
-        except ValueError as error:
-            raise ValueError("Date must use YYYY-MM-DD format.") from error
+            raise ValueError(f"{prefix}each record must be a JSON object.")
+        parsed_date = pd.to_datetime(raw.get("date"), errors="coerce")
+        if pd.isna(parsed_date):
+            raise ValueError(f"{prefix}date is invalid.")
+        row_date = parsed_date.date().isoformat()
         if date.fromisoformat(row_date) > date.today():
-            raise ValueError("Sales records cannot be dated in the future.")
+            raise ValueError(f"{prefix}date cannot be in the future.")
         team, product = raw.get("team"), raw.get("product")
-        if team not in ACTIVE_TEAMS:
-            raise ValueError("Select a valid team.")
-        if product not in PRODUCTS:
-            raise ValueError("Select a valid product.")
-        units = raw.get("units")
-        if isinstance(units, bool) or not isinstance(units, (int, float)):
-            raise ValueError("Units must be a non-negative whole number.")
-        if not np.isfinite(units) or int(units) != units or not 0 <= units <= 1_000_000:
-            raise ValueError("Units must be a non-negative whole number up to 1000000.")
-        return {"date": row_date, "team": team, "product": product, "units": int(units)}
+        if not isinstance(team, str) or not team.strip():
+            raise ValueError(f"{prefix}team must not be empty.")
+        if not isinstance(product, str) or not product.strip():
+            raise ValueError(f"{prefix}product must not be empty.")
+        values: dict[str, float] = {}
+        for column, condition in (("units", lambda value: value >= 0), ("price", lambda value: value > 0)):
+            raw_value = raw.get(column)
+            try:
+                numeric = float(raw_value)
+            except (TypeError, ValueError):
+                raise ValueError(f"{prefix}{column} must be numeric.") from None
+            if isinstance(raw_value, bool) or not np.isfinite(numeric):
+                raise ValueError(f"{prefix}{column} must be numeric.")
+            if not condition(numeric):
+                requirement = "at least 0" if column == "units" else "greater than 0"
+                raise ValueError(f"{prefix}{column} must be {requirement}.")
+            values[column] = numeric
+        return {
+            "date": row_date,
+            "team": team.strip(),
+            "product": product.strip(),
+            **values,
+        }
+
+    def validate_dataset(records: list[dict[str, Any]]) -> None:
+        if not records:
+            raise ValueError("The CSV must contain at least one sales record.")
+        teams = list(dict.fromkeys(row["team"] for row in records))
+        products = list(dict.fromkeys(row["product"] for row in records))
+        if len(teams) > 20:
+            raise ValueError("Row 2: the dataset may contain at most 20 teams.")
+        if len(products) > 10:
+            raise ValueError("Row 2: the dataset may contain at most 10 products.")
+        seen: set[tuple[str, str, str]] = set()
+        dates_by_pair: dict[tuple[str, str], list[date]] = {}
+        for row_number, row in enumerate(records, start=2):
+            key = (row["date"], row["team"], row["product"])
+            if key in seen:
+                raise ValueError(f"Row {row_number}: duplicate date/team/product record.")
+            seen.add(key)
+            dates_by_pair.setdefault((row["team"], row["product"]), []).append(
+                date.fromisoformat(row["date"])
+            )
+        for (team, product), dates in dates_by_pair.items():
+            if (max(dates) - min(dates)).days < 89:
+                raise ValueError(
+                    f"Row 2: {team} / {product} must have at least 90 days of history."
+                )
 
     demo_data_error = {
         "error": "Demo user uses the sample data. Create an account to use your own data."
@@ -381,25 +535,68 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/data/status")
     def data_status():
         username = authenticated_username()
-        if username is None or is_demo_user(username):
-            return jsonify(
-                {
-                    "source": "Source: Synthetic (sample data)",
-                    "record_count": 0,
-                    "demo_user": is_demo_user(username),
-                    "message": demo_data_error["error"] if is_demo_user(username) else None,
-                }
-            )
-        count = user_data.record_count(
-            current_data_user_id(), app.config.get("DATABASE")
+        demo_user = is_demo_user(username)
+        own_records = (
+            []
+            if demo_user
+            else user_data.records(current_data_user_id(), app.config.get("DATABASE"))
         )
+        state = current_runtime()
+        uploaded = bool(own_records) and not demo_user
+        data = pd.DataFrame(own_records) if uploaded else state.sales
+        dates = pd.to_datetime(data["date"]).dt.date if not data.empty else pd.Series(dtype=object)
+        training_state = user_status(current_data_user_id()) if uploaded else {}
         return jsonify(
             {
-                "source": "Source: Uploaded data" if count else "Source: Synthetic (sample data)",
-                "record_count": count,
-                "demo_user": False,
-                "message": None,
+                "source": "uploaded" if uploaded else "synthetic",
+                "rows": len(own_records) if uploaded else len(state.sales),
+                "date_min": min(dates).isoformat() if len(dates) else None,
+                "date_max": max(dates).isoformat() if len(dates) else None,
+                "teams": int(data["team"].nunique()) if not data.empty else 0,
+                "products": int(data["product"].nunique()) if not data.empty else 0,
+                "training": bool(training_state.get("training", False)),
+                "last_error": training_state.get("last_error"),
+                "demo_user": demo_user,
+                "message": demo_data_error["error"] if demo_user else None,
             }
+        )
+
+    @app.get("/api/data/template")
+    def data_template():
+        last_day = date.today()
+        template = pd.DataFrame(
+            [
+                {
+                    "date": (last_day - timedelta(days=offset)).isoformat(),
+                    "team": ACTIVE_TEAMS[0],
+                    "product": PRODUCTS[0],
+                    "units": 20 + offset % 8,
+                    "price": 42.0,
+                }
+                for offset in range(89, -1, -1)
+            ]
+        )
+        content = template.to_csv(index=False).encode("utf-8")
+        return send_file(
+            io.BytesIO(content),
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="fancart-sales-template.csv",
+        )
+
+    @app.get("/api/data/sample")
+    def data_sample():
+        sample_path = APP_ROOT / "sample_sales_data.csv"
+        if not sample_path.is_file():
+            return api_error(
+                "Sample data is unavailable. Run scripts/export_sample_csv.py first.",
+                503,
+            )
+        return send_file(
+            sample_path,
+            mimetype="text/csv",
+            as_attachment=True,
+            download_name="sample_sales_data.csv",
         )
 
     @app.post("/api/data/upload")
@@ -409,35 +606,40 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         uploaded_file = request.files.get("file")
         if uploaded_file is None or not uploaded_file.filename:
             return api_error("Choose a CSV file to upload.", 400)
+        content = uploaded_file.read(2 * 1024 * 1024 + 1)
+        if len(content) > 2 * 1024 * 1024:
+            return api_error("CSV files must be no larger than 2 MB.", 413)
         try:
-            frame = pd.read_csv(io.BytesIO(uploaded_file.read()))
+            frame = pd.read_csv(io.BytesIO(content))
         except (pd.errors.ParserError, UnicodeDecodeError, ValueError):
             return api_error("The uploaded file must be a readable CSV file.", 400)
         frame.columns = [str(column).strip().lower() for column in frame.columns]
-        required = {"date", "team", "product", "units"}
-        if not required.issubset(frame.columns):
-            return api_error("CSV must contain date, team, product and units columns.", 400)
-        if frame.empty:
-            return api_error("The CSV must contain at least one sales record.", 400)
-        if len(frame) > 100_000:
-            return api_error("Upload no more than 100000 sales records at a time.", 413)
+        required = ["date", "team", "product", "units", "price"]
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            return api_error(f"CSV is missing required column(s): {', '.join(missing)}.", 400)
+        if frame.columns.duplicated().any():
+            return api_error("CSV column names must be unique.", 400)
         try:
-            records = [
-                validated_sales_row(row)
-                for row in frame.loc[:, ["date", "team", "product", "units"]].to_dict("records")
-            ]
+            records = []
+            for row_number, raw in enumerate(
+                frame.loc[:, required].to_dict("records"), start=2
+            ):
+                records.append(validated_sales_row(raw, row_number))
+            validate_dataset(records)
         except ValueError as error:
             return api_error(str(error), 400)
-        user_data.replace_records(
-            current_data_user_id(), records, app.config.get("DATABASE")
-        )
+        user_id = current_data_user_id()
+        user_data.replace_records(user_id, records, app.config.get("DATABASE"))
+        start_user_training(user_id)
         return jsonify(
             {
                 "message": f"Uploaded {len(records)} sales records.",
                 "record_count": user_data.record_count(
-                    current_data_user_id(), app.config.get("DATABASE")
+                    user_id, app.config.get("DATABASE")
                 ),
-                "source": "Source: Uploaded data",
+                "source": "uploaded",
+                "training": True,
             }
         )
 
@@ -453,13 +655,22 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         except ValueError as error:
             return api_error(str(error), 400)
         user_id = current_data_user_id()
+        existing = user_data.records(user_id, app.config.get("DATABASE"))
+        teams = {record["team"] for record in existing} | {row["team"]}
+        products = {record["product"] for record in existing} | {row["product"]}
+        if len(teams) > 20:
+            return api_error("The dataset may contain at most 20 teams.", 400)
+        if len(products) > 10:
+            return api_error("The dataset may contain at most 10 products.", 400)
         user_data.upsert_record(user_id, row, app.config.get("DATABASE"))
+        start_user_training(user_id)
         count = user_data.record_count(user_id, app.config.get("DATABASE"))
         return jsonify(
             {
                 "message": "Sales record saved.",
                 "record_count": count,
-                "source": "Source: Uploaded data",
+                "source": "uploaded",
+                "training": True,
             }
         ), 201
 
@@ -467,18 +678,31 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     def data_reset():
         if is_demo_user():
             return jsonify(demo_data_error), 403
-        user_data.reset(current_data_user_id(), app.config.get("DATABASE"))
+        user_id = current_data_user_id()
+        user_data.reset(user_id, app.config.get("DATABASE"))
+        with user_training_state_lock:
+            state = user_training_state.setdefault(
+                user_id,
+                {"training": False, "last_error": None, "version": 0, "worker": False},
+            )
+            state["version"] += 1
+            state.update({"training": False, "last_error": None})
+        user_models.pop(user_id, None)
+        user_model_path(user_id).unlink(missing_ok=True)
         return jsonify(
             {
                 "message": "Your data was reset to the sample data.",
                 "record_count": 0,
-                "source": "Source: Synthetic (sample data)",
+                "source": "synthetic",
+                "training": False,
             }
         )
 
     @app.get("/api/meta")
     def meta():
         state = current_runtime()
+        teams = sorted(state.sales["team"].dropna().unique().tolist())
+        products = sorted(state.sales["product"].dropna().unique().tolist())
         fixtures = state.fixtures.copy()
         today = pd.Timestamp.today().normalize()
         fixtures = fixtures[
@@ -487,8 +711,8 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         ].sort_values("date")
         return jsonify(
             {
-                "teams": list(ACTIVE_TEAMS),
-                "products": list(PRODUCTS),
+                "teams": teams,
+                "products": products,
                 "fixtures": [
                     {
                         "date": pd.Timestamp(row.date).date().isoformat(),
@@ -498,7 +722,11 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
                     for row in fixtures.itertuples(index=False)
                 ],
                 "data_source": f"Match data: {state.source}",
-                "sales_note": "Sales data is synthetic.",
+                "sales_note": (
+                    "Using your uploaded data."
+                    if state.sales_source == "uploaded"
+                    else "Sales data is synthetic."
+                ),
             }
         )
 
@@ -506,9 +734,14 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     def kpis():
         state = current_runtime()
         today = pd.Timestamp.today().normalize()
-        combinations = [(team, product) for team in ACTIVE_TEAMS for product in PRODUCTS]
+        combinations = list(
+            state.sales[["team", "product"]]
+            .drop_duplicates()
+            .itertuples(index=False, name=None)
+        )
+        teams = sorted(state.sales["team"].unique())
         next_matches = {}
-        for team in ACTIVE_TEAMS:
+        for team in teams:
             relevant = state.fixtures[
                 ((state.fixtures["team1"] == team) | (state.fixtures["team2"] == team))
                 & (pd.to_datetime(state.fixtures["date"]) > today)
@@ -541,21 +774,26 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
                 risk_count += 1
         uplift = 0.0
         upcoming = state.fixtures[
-            pd.to_datetime(state.fixtures["date"]) > today
+            (pd.to_datetime(state.fixtures["date"]) > today)
+            & (
+                state.fixtures["team1"].isin(teams)
+                | state.fixtures["team2"].isin(teams)
+            )
         ].sort_values("date")
         if not upcoming.empty:
             fixture = upcoming.iloc[0]
-            team = fixture["team1"] if fixture["team1"] in ACTIVE_TEAMS else fixture["team2"]
+            team = fixture["team1"] if fixture["team1"] in teams else fixture["team2"]
             match_day = pd.Timestamp(fixture["date"]).normalize()
             start = today + pd.Timedelta(1, unit="D")
             horizon = max(7, (match_day - today).days + 8)
+            product = combinations[0][1]
             expected = forecast_product(
                 state.sales, state.matches, state.fixtures, state.model,
-                team, PRODUCTS[0], start, horizon, "expected", match_day, recursive=False,
+                team, product, start, horizon, "expected", match_day, recursive=False,
             )
             winning = forecast_product(
                 state.sales, state.matches, state.fixtures, state.model,
-                team, PRODUCTS[0], start, horizon, "win", match_day, recursive=False,
+                team, product, start, horizon, "win", match_day, recursive=False,
             )
             post_match = (winning["date"] > match_day) & (
                 winning["date"] <= match_day + pd.Timedelta(7, unit="D")
@@ -576,9 +814,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     def forecast():
         state = current_runtime()
         team, product = request.args.get("team"), request.args.get("product")
-        if team not in ACTIVE_TEAMS:
+        if team not in set(state.sales["team"].unique()):
             return api_error("Select a valid team.", 400)
-        if product not in PRODUCTS:
+        if product not in set(state.sales["product"].unique()):
             return api_error("Select a valid product.", 400)
         try:
             days = int(request.args.get("days", "14"))
@@ -640,9 +878,9 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         match_date_value = body.get("match_date")
         outcome = body.get("outcome")
         lead_time = body.get("lead_time")
-        if team not in ACTIVE_TEAMS:
+        if team not in set(state.sales["team"].unique()):
             return api_error("Select a valid team.", 400)
-        if product not in PRODUCTS:
+        if product not in set(state.sales["product"].unique()):
             return api_error("Select a valid product.", 400)
         if not isinstance(outcome, str) or outcome not in {"win", "loss"}:
             return api_error("Outcome must be win or loss.", 400)
@@ -698,12 +936,17 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
     @app.get("/api/report")
     def report():
         state = current_runtime()
-        metrics_path = APP_ROOT / "metrics.json"
-        try:
-            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            app.logger.exception("Unable to read metrics.json.")
-            return api_error("Model metrics are unavailable.", 503)
+        if state.sales_source == "uploaded":
+            metrics = state.model.get("metrics", {})
+            validation_cutoff = state.model.get("validation_cutoff")
+        else:
+            metrics_path = APP_ROOT / "metrics.json"
+            try:
+                metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                app.logger.exception("Unable to read metrics.json.")
+                return api_error("Model metrics are unavailable.", 503)
+            validation_cutoff = metrics.get("validation_cutoff")
         sample = state.model["validation_sample"]
         importance = permutation_importance(
             state.model["median"],
@@ -723,11 +966,15 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
         )
         return jsonify(
             {
-                "validation_cutoff": metrics.get("validation_cutoff"),
+                "validation_cutoff": validation_cutoff,
                 "model": metrics["model"],
                 "seasonal_naive": metrics["seasonal_naive"],
                 "feature_importance": ranked,
-                "note": "Sales data is synthetic.",
+                "note": (
+                    "Using your uploaded data."
+                    if state.sales_source == "uploaded"
+                    else "Sales data is synthetic."
+                ),
             }
         )
 
@@ -790,7 +1037,11 @@ def create_app(config: dict[str, Any] | None = None) -> Flask:
                 "average_demand_after_losses": float(loss_values.mean()) if not loss_values.empty else 0.0,
                 "average_match_day_demand": float(match_day["units"].mean()) if not match_day.empty else 0.0,
                 "average_non_match_day_demand": float(non_match_day["units"].mean()) if not non_match_day.empty else 0.0,
-                "note": "Insights are descriptive comparisons from synthetic sales data.",
+                "note": (
+                    "Using your uploaded data; match outcomes use the available match history."
+                    if state.sales_source == "uploaded"
+                    else "Insights are descriptive comparisons from synthetic sales data."
+                ),
             }
         )
 
